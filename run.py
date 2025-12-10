@@ -4,6 +4,7 @@ import torch
 import torch.backends
 import json
 from exp.exp_long_term_forecasting import Exp_Long_Term_Forecast
+from ar.ar_long_term_forecasting import AR_Long_Term_Forecast
 from utils.print_args import print_args
 import random
 import numpy as np
@@ -24,7 +25,7 @@ if __name__ == '__main__':
 
     # basic config
     parser.add_argument('--task_name', type=str, required=True, default='long_term_forecast',
-                        help='task name, options:[long_term_forecast]')
+                        help='task name, options:[long_term_forecast, ar_long_term_forecast]')
     parser.add_argument('--is_training', type=int, required=True, default=1, help='status')
     parser.add_argument('--model_id', type=str, required=True, default='test', help='model id')
     parser.add_argument('--model', type=str, required=True, default='CIDC')
@@ -85,7 +86,6 @@ if __name__ == '__main__':
     parser.add_argument('--des', type=str, default='test', help='exp description')
     parser.add_argument('--loss', type=str, default='MSE', help='loss function')
     parser.add_argument('--lradj', type=str, default='type1', help='adjust learning rate')
-    parser.add_argument('--use_amp', action='store_true', help='use automatic mixed precision training', default=False)
 
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
@@ -177,8 +177,10 @@ if __name__ == '__main__':
 
     if args.task_name == 'long_term_forecast':
         Exp = Exp_Long_Term_Forecast
+    elif args.task_name == 'ar_long_term_forecast':
+        Exp = AR_Long_Term_Forecast
     else:
-        Exp = Exp_Long_Term_Forecast
+        raise ValueError(f'Task name {args.task_name} not supported')
 
     if args.is_training:
         # print the total number of parameters

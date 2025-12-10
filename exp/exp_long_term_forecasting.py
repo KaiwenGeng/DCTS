@@ -56,17 +56,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.model_name in self.dc_models:
-                            outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                if self.model_name in self.dc_models:
+                    outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.model_name in self.dc_models:
-                        outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, f_dim:]
                 batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
@@ -98,9 +91,6 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
 
-        if self.args.use_amp:
-            scaler = torch.cuda.amp.GradScaler()
-
         for epoch in range(self.args.train_epochs):
             iter_count = 0
             train_loss = []
@@ -121,51 +111,25 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
                 # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.model_name in self.dc_models:
-                            outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                        f_dim = -1 if self.args.features == 'MS' else 0
-                        outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                        batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, batch_y)
-                        if self.model_name in self.dc_models:
-                            '''
-                            HNet Specific
-                            '''
-
-                            moe_loss = 0.0
-                            for obj in boundary_predictions:
-                                moe_loss += self.args.hnet_moe_loss_weight * load_balancing_loss(obj, self.args.hnet_num_experts)
-
-                            joint_loss = loss + moe_loss
-                            ratio_loss.append(moe_loss.item())
-                        train_loss.append(loss.item())
-                        
-
+                if self.model_name in self.dc_models:
+                    outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.model_name in self.dc_models:
-                        outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
-                    f_dim = -1 if self.args.features == 'MS' else 0
-                    outputs = outputs[:, -self.args.pred_len:, f_dim:]
-                    batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
-                    loss = criterion(outputs, batch_y)
-                    if self.model_name in self.dc_models:
-                        '''
-                        HNet Specific
-                        '''
-                        moe_loss = 0.0
-                        for obj in boundary_predictions:
-                            moe_loss += self.args.hnet_moe_loss_weight * load_balancing_loss(obj, self.args.hnet_num_experts)
-                        joint_loss = loss + moe_loss
-                        ratio_loss.append(moe_loss.item())
-                    train_loss.append(loss.item())
+                f_dim = -1 if self.args.features == 'MS' else 0
+                outputs = outputs[:, -self.args.pred_len:, f_dim:]
+                batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
+                loss = criterion(outputs, batch_y)
+                if self.model_name in self.dc_models:
+                    '''
+                    HNet Specific
+                    '''
+                    moe_loss = 0.0
+                    for obj in boundary_predictions:
+                        moe_loss += self.args.hnet_moe_loss_weight * load_balancing_loss(obj, self.args.hnet_num_experts)
+                    joint_loss = loss + moe_loss
+                    ratio_loss.append(moe_loss.item())
+                train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:
                     print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.item()))
@@ -175,19 +139,11 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                     iter_count = 0
                     time_now = time.time()
 
-                if self.args.use_amp:
-                    if self.model_name in self.dc_models:
-                        scaler.scale(joint_loss).backward()
-                    else:
-                        scaler.scale(loss).backward()
-                    scaler.step(model_optim)
-                    scaler.update()
+                if self.model_name in self.dc_models:
+                    joint_loss.backward()
                 else:
-                    if self.model_name in self.dc_models:
-                        joint_loss.backward()
-                    else:
-                        loss.backward()
-                    model_optim.step()
+                    loss.backward()
+                model_optim.step()
 
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(train_loss)
@@ -237,17 +193,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.model_name in self.dc_models:
-                            outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                if self.model_name in self.dc_models:
+                    outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.model_name in self.dc_models:
-                        outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
@@ -366,17 +315,10 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.args.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
                 # encoder - decoder
-                if self.args.use_amp:
-                    with torch.cuda.amp.autocast():
-                        if self.model_name in self.dc_models:
-                            outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                        else:
-                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                if self.model_name in self.dc_models:
+                    outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                 else:
-                    if self.model_name in self.dc_models:
-                        outputs, boundary_predictions = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.args.pred_len:, :]
