@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import json
 from hnet.models.hnet import HNet
 
-from layers.Embed import PositionalEmbedding
 from hnet.models.config_hnet import HNetConfig, SSMConfig, AttnConfig
 
 
@@ -18,7 +17,6 @@ class Model(nn.Module):
         self.seq_len = configs.seq_len
         self.embedding_dim = configs.hnet_d_model[0]
         self.embedding = nn.Linear(configs.enc_in, self.embedding_dim)
-        self.position_embedding = PositionalEmbedding(self.embedding_dim)
         arch_layout = json.loads(configs.hnet_arch_layout)
         self.c_in = configs.enc_in
         ssm_cfg = SSMConfig(
@@ -43,12 +41,19 @@ class Model(nn.Module):
         self.out_layer = nn.Linear(self.embedding_dim, configs.c_out, bias=False)
 
     def forecast(self, seq, seq_mark):
-        mean_enc = seq.mean(1, keepdim=True).detach()
+        # seq shape: [Batch, Length, Channels]
+        # Only use the first self.seq_len steps (the lookback window) to calculate stats
+        # This works for both Training (Length = 191) and Inference (Length = 96)
+        seq_len_for_stats = min(seq.shape[1], self.seq_len)
+        
+        mean_enc = seq[:, :seq_len_for_stats, :].mean(1, keepdim=True).detach()
+        # Calculate std on the same window
+        std_enc = torch.sqrt(torch.var(seq[:, :seq_len_for_stats, :], dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
+        
         seq = seq - mean_enc
-        std_enc = torch.sqrt(torch.var(seq, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         seq = seq / std_enc
         # print(f"the shape of seq: {seq.shape}")
-        hnet_input = self.embedding(seq) + self.position_embedding(seq)
+        hnet_input = self.embedding(seq) 
         hnet_input = hnet_input.to(torch.bfloat16)
         self.out_layer = self.out_layer.to(torch.bfloat16)
         # print(f"the shape of hnet_input: {hnet_input.shape}")

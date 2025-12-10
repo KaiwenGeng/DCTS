@@ -21,7 +21,7 @@ class AR_Long_Term_Forecast(AR_Basic):
         self.model_name = args.model
         # make sure the label_len is 0
         assert self.args.label_len == self.args.seq_len, "Label len must be the same as the seq len for autoregressive training"
-        # assert self.args.pred_len == 1, "Pred len must be 1 for autoregressive training"
+        self.single_batch = True
 
 
     def _build_model(self):
@@ -44,28 +44,84 @@ class AR_Long_Term_Forecast(AR_Basic):
         return criterion
 
 
+    def generate(self, batch_x, pred_len, single_batch=True):
+        model = self.model
+        if isinstance(model, nn.DataParallel):
+            model = model.module
 
+        # 1. Normalization (matching ARDC.py forecast logic)
+        mean_enc = batch_x.mean(1, keepdim=True).detach()
+        std_enc = torch.sqrt(torch.var(batch_x - mean_enc, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
+        batch_x_norm = (batch_x - mean_enc) / std_enc
 
-
-    
-    def autoregressive_inference(self, seq, seq_mark):
-        predictions = []
-        current_input = seq.clone()  # Shape: (B, seq_len, features)
+        B, L, C = batch_x.shape
+        device = batch_x.device
         
-        for i in range(self.args.pred_len):
-            if self.model_name in self.dc_models:
-                outputs, boundary_predictions = self.model(current_input, seq_mark)
-            else:
-                outputs = self.model(current_input, seq_mark)
+        predictions_list = []
+
+        # Iterate over each sample in the batch to handle batch_size=1 restriction in HNet inference
+        for i in range(B):
+            # Shape: [1, L, C]
+            sample_x = batch_x_norm[i:i+1]
             
-            # Get the next step prediction
-            next_pred = outputs[:, -1:, :]  # Shape: (B, 1, features)
-            predictions.append(next_pred)
+            # 2. Allocate Inference Cache for single sample
+            inference_params = model.hnet.allocate_inference_cache(1, L + pred_len, dtype=torch.bfloat16)
             
-            # Slide window: drop first step, append prediction
-            current_input = torch.cat([current_input[:, 1:, :], next_pred], dim=1)
+            # 3. Prefill (Process Prompt)
+            # Embed and convert to bfloat16 as expected by HNet
+            hidden_states = model.embedding(sample_x).to(torch.bfloat16)
+            mask = torch.ones(1, L, dtype=torch.bool, device=device)
+            
+            with torch.inference_mode():
+                # Pass prompt through HNet to fill cache
+                # Returns: hidden_states, main_network_output, boundary_predictions
+                hidden_states_out, _, _ = model.hnet(
+                    hidden_states,
+                    mask=mask,
+                    inference_params=inference_params
+                )
+                
+                # Use the last hidden state to predict the first future step
+                last_hidden = hidden_states_out[:, -1:, :] # [1, 1, D]
+                
+                # Project to output space
+                model.out_layer = model.out_layer.to(torch.bfloat16)
+                next_token_norm = model.out_layer(last_hidden) # [1, 1, C]
+                
+                sample_generated = []
+                sample_generated.append(next_token_norm)
+                
+                curr_token_norm = next_token_norm
+                
+                # 4. Generation Loop
+                for _ in range(pred_len - 1):
+                    # Embed current prediction to get input for next step
+                    # Ensure input matches embedding layer dtype
+                    curr_input = curr_token_norm.to(device).to(model.embedding.weight.dtype)
+                    curr_embed = model.embedding(curr_input).to(torch.bfloat16) # [1, 1, D]
+                    
+                    # Step through HNet
+                    hidden_states_step, _, _ = model.hnet.step(curr_embed, inference_params)
+                    
+                    # Project
+                    curr_token_norm = model.out_layer(hidden_states_step)
+                    sample_generated.append(curr_token_norm)
+            
+            # Concatenate time steps for this sample: [1, pred_len, C]
+            predictions_list.append(torch.cat(sample_generated, dim=1))
+            if single_batch:
+                break
+
+        # 5. Combine batch
+        predictions = torch.cat(predictions_list, dim=0) # [B, pred_len, C] or [1, pred_len, C] if single_batch
         
-        return torch.cat(predictions, dim=1) 
+        # 6. Denormalize - slice stats if single_batch
+        if single_batch:
+            predictions = predictions.float() * std_enc[:1] + mean_enc[:1]
+        else:
+            predictions = predictions.float() * std_enc + mean_enc
+        
+        return predictions
 
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
@@ -92,22 +148,23 @@ class AR_Long_Term_Forecast(AR_Basic):
 
             self.model.train()
             epoch_time = time.time()
-            for i, (batch_x, batch_seq, batch_x_mark, batch_seq_mark) in enumerate(train_loader):
+            for i, (_, batch_seq, _, batch_seq_mark) in enumerate(train_loader):
                 iter_count += 1
                 model_optim.zero_grad()
                 SEQ_LABEL = batch_seq[:, self.args.seq_len:, :].float().to(self.device)
-                batch_seq = batch_seq[:, :self.args.seq_len + 1, :]
+                # batch_seq = batch_seq[:, :self.args.seq_len + 1, :]
+                model_input = batch_seq[:, :-1, :]
                 # print(f"the shape of batch_seq: {batch_seq.shape}")
                 # # make sure the batch_seq is just batch x with 1 extra step
                 # print(f"check the value matching: {torch.equal(batch_seq[:, :-1, :], batch_x)}")
-                batch_x = batch_x.float().to(self.device)
+                model_input = model_input.float().to(self.device)
                 batch_seq = batch_seq.float().to(self.device) # [batch_size, label_len + pred_len, num_features], [x0, x1, x2, ..., x95, 96] if our seq len is 96 (because we always "1 step" ahead of the input sequence)
-                batch_x_mark = batch_x_mark.float().to(self.device)
+                # batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_seq_mark = batch_seq_mark.float().to(self.device)
                 if self.model_name in self.dc_models:
-                    outputs, boundary_predictions = self.model(batch_x, batch_x_mark) # takes in [x0, x1, x2, ..., x95] and outputs [x1_pred, x2_pred, ..., x96_pred]
+                    outputs, boundary_predictions = self.model(model_input, None) # takes in [x0, x1, x2, ..., x95] and outputs [x1_pred, x2_pred, ..., x96_pred]
                 else:
-                    outputs = self.model(batch_x, batch_x_mark) # takes in [x0, x1, x2, ..., x95] and outputs [x1_pred, x2_pred, ..., x96_pred]
+                    outputs = self.model(model_input, None) # takes in [x0, x1, x2, ..., x95] and outputs [x1_pred, x2_pred, ..., x96_pred]
                 # print(f"the shape of last step's prediction: {outputs[:,-1,:].shape}")
                 # print(f"the shape of last step's true value: {batch_seq[:, -1, :].shape}")
                 # breakpoint()
@@ -121,33 +178,32 @@ class AR_Long_Term_Forecast(AR_Basic):
                         moe_loss += self.args.hnet_moe_loss_weight * load_balancing_loss(obj, self.args.hnet_num_experts)
                     joint_loss = tf_training_loss + moe_loss
                     ratio_loss.append(moe_loss.item())
-                # train_loss.append(loss.item())
-                with torch.no_grad():
-                    seq_pred = self.autoregressive_inference(batch_x, batch_x_mark)
-                # print(f"the shape of seq_pred: {seq_pred.shape}")
-                # print(f"the shape of SEQ_LABEL: {SEQ_LABEL.shape}")
-                # breakpoint()
-                seq_loss = criterion(seq_pred, SEQ_LABEL)
-                train_loss.append(seq_loss.item())
+                train_loss.append(tf_training_loss.item())
 
-                if (i + 1) % 1 == 0:
-                    print("\titers: {0}, epoch: {1} | seq loss: {2:.7f}".format(i + 1, epoch + 1, seq_loss.item()))
+                if (i + 1) % 20 == 0:
+                    with torch.no_grad():
+                        
+                        generated_output = self.generate(model_input[:, :self.args.seq_len, :], pred_len=self.args.pred_len, single_batch=self.single_batch)
+                        if self.single_batch:
+                            seq_loss = criterion(generated_output, SEQ_LABEL[:1])
+                        else:
+                            seq_loss = criterion(generated_output, SEQ_LABEL)
+                    print("\titers: {0}, epoch: {1} | tf loss: {2:.7f} | moe loss: {3:.7f} | seq loss: {4:.7f}".format(i + 1, epoch + 1, tf_training_loss.item(), moe_loss.item(), seq_loss.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
                     print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
                     iter_count = 0
                     time_now = time.time()
-
+                
                 if self.model_name in self.dc_models:
                     joint_loss.backward()
                 else:
                     tf_training_loss.backward()
                 model_optim.step()
-
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
-            train_loss = np.average(train_loss)
-            ratio_loss = np.average(ratio_loss)
             breakpoint()
+
+
+                    
 
 
                 

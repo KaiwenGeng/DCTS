@@ -30,7 +30,7 @@ python -u run.py \
   --hnet_ssm_d_state 64 \
   --hnet_ssm_expand 2 \
   --hnet_attn_num_heads 2 2 \
-  --hnet_attn_rotary_emb_dim 0 0 \
+  --hnet_attn_rotary_emb_dim 8 8 \
   --hnet_attn_window_size -1 -1 \
   --hnet_num_experts 8 \
   --hnet_moe_loss_weight 0.01 \
