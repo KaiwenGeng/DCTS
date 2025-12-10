@@ -123,6 +123,26 @@ class AR_Long_Term_Forecast(AR_Basic):
         
         return predictions
 
+    def vali(self, vali_data, vali_loader, criterion):
+        total_loss = []
+        self.model.eval()
+        with torch.no_grad():
+            for i, (_, batch_seq, _, batch_seq_mark) in enumerate(vali_loader):
+                SEQ_LABEL = batch_seq[:, self.args.seq_len:, :].float().to(self.device)
+                # batch_seq = batch_seq[:, :self.args.seq_len + 1, :]
+                model_input = batch_seq[:, :-1, :].float().to(self.device) 
+
+                generated_output = self.generate(model_input[:, :self.args.seq_len, :], pred_len=self.args.pred_len, single_batch=self.single_batch)
+                f_dim = -1 if self.args.features == 'MS' else 0
+                if self.single_batch:
+                    seq_loss = criterion(generated_output[:, :, f_dim:], SEQ_LABEL[:1, :, f_dim:])
+                else:
+                    seq_loss = criterion(generated_output[:, :, f_dim:], SEQ_LABEL[:, :, f_dim:])
+                total_loss.append(seq_loss.item())
+        total_loss = np.average(total_loss)
+        self.model.train()
+        return total_loss
+
     def train(self, setting):
         train_data, train_loader = self._get_data(flag='train')
         vali_data, vali_loader = self._get_data(flag='val')
@@ -168,7 +188,9 @@ class AR_Long_Term_Forecast(AR_Basic):
                 # print(f"the shape of last step's prediction: {outputs[:,-1,:].shape}")
                 # print(f"the shape of last step's true value: {batch_seq[:, -1, :].shape}")
                 # breakpoint()
-                tf_training_loss = criterion(outputs, batch_seq[:, 1:, :]) # since we asserted that the pred len is 1, we can just take the last step's prediction and the last step's true value. Teacher forcing training loss.
+                f_dim = -1 if self.args.features == 'MS' else 0
+                # print(f"current mode is {self.args.features}, with f_dim: {f_dim}")
+                tf_training_loss = criterion(outputs[:, :, f_dim:], batch_seq[:, 1:, f_dim:]) # since we asserted that the pred len is 1, we can just take the last step's prediction and the last step's true value. Teacher forcing training loss.
                 if self.model_name in self.dc_models:
                     '''
                     HNet Specific
@@ -185,9 +207,9 @@ class AR_Long_Term_Forecast(AR_Basic):
                         
                         generated_output = self.generate(model_input[:, :self.args.seq_len, :], pred_len=self.args.pred_len, single_batch=self.single_batch)
                         if self.single_batch:
-                            seq_loss = criterion(generated_output, SEQ_LABEL[:1])
+                            seq_loss = criterion(generated_output[:, :, f_dim:], SEQ_LABEL[:1, :, f_dim:])
                         else:
-                            seq_loss = criterion(generated_output, SEQ_LABEL)
+                            seq_loss = criterion(generated_output[:, :, f_dim:], SEQ_LABEL[:, :, f_dim:])
                     print("\titers: {0}, epoch: {1} | tf loss: {2:.7f} | moe loss: {3:.7f} | seq loss: {4:.7f}".format(i + 1, epoch + 1, tf_training_loss.item(), moe_loss.item(), seq_loss.item()))
                     speed = (time.time() - time_now) / iter_count
                     left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
@@ -200,8 +222,32 @@ class AR_Long_Term_Forecast(AR_Basic):
                 else:
                     tf_training_loss.backward()
                 model_optim.step()
-            breakpoint()
 
+
+            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+            train_loss = np.average(train_loss)
+            ratio_loss = np.average(ratio_loss)
+            vali_loss = self.vali(vali_data, vali_loader, criterion)
+            test_loss = self.vali(test_data, test_loader, criterion)
+            if self.model_name in self.dc_models:
+                print("Epoch: {0}, Steps: {1} | teacher forcing loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f} Ratio Loss: {5:.7f}".format(
+                    epoch + 1, train_steps, train_loss, vali_loss, test_loss, ratio_loss))
+            else:
+                print("Epoch: {0}, Steps: {1} | teacher forcing loss: {2:.7f} Vali Loss: {3:.7f} Test Loss: {4:.7f}".format(
+                    epoch + 1, train_steps, train_loss, vali_loss, test_loss))
+            early_stopping(vali_loss, self.model, path)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+            adjust_learning_rate(model_optim, epoch + 1, self.args)
+
+        best_model_path = path + '/' + 'checkpoint.pth'
+        self.model.load_state_dict(torch.load(best_model_path))
+
+        return self.model
+    
+    " Note, for test, we must use the single_batch = False because we need to test the whole batch"
 
                     
 
